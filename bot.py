@@ -1,305 +1,229 @@
-
 import os
-import re
-import json
 import asyncio
+import json
+import random
+import sqlite3
 from datetime import datetime, timedelta
 
-from telegram import Update, ChatPermissions, User
-from telegram.constants import ChatType, ParseMode
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram import Update, ChatPermissions
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
 
-from openai import OpenAI
+from openai import AsyncOpenAI
 
-from memory import init_db, inc_warning, reset_warnings, inc_mutes, add_memory, get_recent_memory, add_audit
-from hafez import get_fal
 
-# -------- Settings (from env) --------
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+# ========= تنظیمات ========= #
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "")
 INFRACTION_LIMIT = int(os.getenv("INFRACTION_LIMIT", "5"))
 MUTE_DURATION_HOURS = int(os.getenv("MUTE_DURATION_HOURS", "12"))
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-MEMORY_LENGTH = int(os.getenv("MEMORY_LENGTH", "12"))
-MEETUP_BOT_USERNAME = os.getenv("MEETUP_BOT_USERNAME", "@Meetupyazd_bot")
+MEETUP_BOT_USERNAME = os.getenv("MEETUP_BOT_USERNAME", "")
 
-if not TELEGRAM_TOKEN:
-    raise SystemExit("TELEGRAM_BOT_TOKEN env is required")
+# کلاینت OpenAI
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-# OpenAI client
-client = None
-if OPENAI_API_KEY:
-    client = OpenAI(api_key=OPENAI_API_KEY)
+# ========= دیتابیس برای اخطار و حافظه ========= #
+DB_FILE = "bot.db"
 
-# Load profanity list
-def load_profanities():
-    try:
-        with open("profanity.json", "r", encoding="utf-8") as f:
-            return set(json.load(f))
-    except Exception:
-        return set()
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS warnings (
+                user_id INTEGER,
+                count INTEGER,
+                last_update TIMESTAMP
+            )"""
+    )
+    conn.commit()
+    conn.close()
 
-PROFANITIES = load_profanities()
+init_db()
 
-def normalize_fa(text: str) -> str:
-    text = text.lower()
-    repl = {
-        "ي": "ی", "ك": "ک",
-        "ۀ": "ه", "ة": "ه",
-        "ؤ": "و", "أ": "ا", "إ": "ا",
-    }
-    for a, b in repl.items():
-        text = text.replace(a, b)
-    # remove diacritics and ZWNJ
-    text = re.sub(r"[\u064B-\u065F\u0610-\u061A\u06D6-\u06ED\u200c]", "", text)
-    return text
+def get_warnings(user_id: int) -> int:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT count FROM warnings WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else 0
 
-async def ensure_admin_notice(context: ContextTypes.DEFAULT_TYPE, text: str):
-    try:
-        if ADMIN_ID:
-            await context.bot.send_message(chat_id=ADMIN_ID, text=text)
-        elif ADMIN_USERNAME:
-            await context.bot.send_message(chat_id=ADMIN_USERNAME, text=text)
-    except Exception:
-        pass
+def add_warning(user_id: int) -> int:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    now = datetime.now()
+    count = get_warnings(user_id)
+    if count:
+        c.execute("UPDATE warnings SET count = ?, last_update = ? WHERE user_id = ?", (count+1, now, user_id))
+    else:
+        c.execute("INSERT INTO warnings (user_id, count, last_update) VALUES (?, ?, ?)", (1, now, user_id))
+    conn.commit()
+    conn.close()
+    return get_warnings(user_id)
 
+def reset_warnings(user_id: int):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM warnings WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+
+# ========= فیلتر فحش ========= #
+with open("profanity.json", "r", encoding="utf-8") as f:
+    BAD_WORDS = set(json.load(f))
+
+
+def contains_bad_word(text: str) -> bool:
+    return any(bad in text.lower() for bad in BAD_WORDS)
+
+
+# ========= هندلرها ========= #
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
     await update.message.reply_text(
-        f"سلام {user.first_name} 👋\nمن ربات میت‌آپ هوش مصنوعی‌ام؛ می‌تونی بهم بگی «ربات یه فال حافظ» یا «ربات یه جوک» یا با دستور /ai باهام گپ بزنی."
+        "سلام 👋 من یک ربات هوش مصنوعی هستم.\n"
+        "می‌تونی باهام چت کنی، فال حافظ بگیری یا ازم سوال بپرسی."
     )
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = (
-        "دستورات:\n"
-        "• /ai متن — گپ با هوش مصنوعی\n"
-        "• /hafez — فال حافظ\n"
-        "• /invite — دریافت لینک عضویت (درخواست بده تا برات بفرستم)\n"
-        "• /addbadword کلمه — اضافه‌کردن کلمه نامناسب (ادمین)\n"
-        "• /warns — دیدن اخطارهای خودت\n"
-    )
-    await update.message.reply_text(txt)
 
-async def new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    for m in update.message.new_chat_members:
-        if m.is_bot:
-            continue
+async def welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    for member in update.message.new_chat_members:
         await update.message.reply_text(
-            f"🎉 خوش اومدی {m.first_name} عزیز!\n"
-            "اینجا با احترام و حال خوب کنار همیم. هر کمکی خواستی صدام کن: «ربات ...»"
+            f"🌹 خوش اومدی {member.mention_html()} عزیز! امیدوارم لحظات خوبی اینجا داشته باشی.",
+            parse_mode="HTML",
         )
 
-def contains_profanity(text: str) -> bool:
-    if not text:
-        return False
-    t = normalize_fa(text)
-    # simple token & substring check
-    words = re.findall(r"[0-9\u0600-\u06FF\w]+", t)
-    for w in words:
-        for bad in PROFANITIES:
-            if bad and bad in w:
-                return True
-    return False
 
-async def handle_profanity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Returns True if message handled (muted/banned), else False"""
-    msg = update.effective_message
-    user = msg.from_user
-    chat_id = msg.chat_id
-    text = msg.text or msg.caption or ""
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    user = update.effective_user
 
-    if not contains_profanity(text):
-        return False
-
-    warnings, mutes = inc_warning(chat_id, user.id)
-    await msg.reply_text(f"⚠️ {user.first_name} عزیز، لطفاً از واژه‌های محترمانه استفاده کن. اخطار {warnings}/{INFRACTION_LIMIT}")
-
-    if warnings >= INFRACTION_LIMIT:
-        # mute
-        until = datetime.utcnow() + timedelta(hours=MUTE_DURATION_HOURS)
-        try:
-            await context.bot.restrict_chat_member(
-                chat_id=chat_id,
-                user_id=user.id,
-                permissions=ChatPermissions(can_send_messages=False),
-                until_date=until
+    # چک فحش
+    if contains_bad_word(text):
+        warns = add_warning(user.id)
+        if warns < INFRACTION_LIMIT:
+            await update.message.reply_text(
+                f"⚠️ {user.mention_html()} عزیز، لطفاً رعایت کن. اخطار {warns}/{INFRACTION_LIMIT}",
+                parse_mode="HTML",
             )
-            reset_warnings(chat_id, user.id)
-            total_mutes = inc_mutes(chat_id, user.id)
-            await msg.reply_text(f"🔇 {user.first_name} به مدت {MUTE_DURATION_HOURS} ساعت در سکوت قرار گرفت.")
-            add_audit(chat_id, user.id, context.bot.id, "mute", "profanity_limit_reached")
-            await ensure_admin_notice(context, f"🔔 سکوت کاربر @{user.username or user.id} به دلیل فحاشی در {chat_id}. مجموع سکوت‌ها: {total_mutes}")
-            # if repeated mutes, ban
-            if total_mutes >= 2:
-                await context.bot.ban_chat_member(chat_id=chat_id, user_id=user.id)
-                await msg.reply_text(f"⛔️ {user.first_name} به دلیل تکرار بی‌احترامی بن شد.")
-                add_audit(chat_id, user.id, context.bot.id, "ban", "repeat_offender")
-                await ensure_admin_notice(context, f"⛔️ کاربر @{user.username or user.id} بن شد (تکرار).")
-        except Exception as e:
-            await ensure_admin_notice(context, f"❗️نتوانستم کاربر را محدود کنم: {e}")
-    return True
-
-async def invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    user = update.effective_user
-    try:
-        # Try to create a new invite link (requires admin)
-        link = None
-        try:
-            inv = await context.bot.create_chat_invite_link(chat_id=chat.id, name=f"Request by {user.id}", creates_join_request=False)
-            link = inv.invite_link
-        except Exception:
-            # fallback to the provided bot username
-            link = f"https://t.me/{MEETUP_BOT_USERNAME.lstrip('@')}"
-        await update.message.reply_text(f"🔗 لینک عضویت: {link}\n(در صورت نیاز برای امنیت، لینک فقط به درخواست ارسال می‌شود.)")
-    except Exception as e:
-        await update.message.reply_text("نتوانستم لینک بدهم. احتمالاً دسترسی ادمین ندارم.")
-
-async def ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if client is None:
-        await update.message.reply_text("کلید OpenAI تنظیم نشده است.")
-        return
-    user = update.effective_user
-    chat = update.effective_chat
-    # message after /ai command
-    user_text = " ".join(context.args) if context.args else (update.message.text or "")
-    user_text = user_text.replace("/ai", "", 1).strip()
-
-    if not user_text:
-        await update.message.reply_text("متن سوالت رو بعد از /ai بنویس 🌱")
+        else:
+            until = datetime.now() + timedelta(hours=MUTE_DURATION_HOURS)
+            await context.bot.restrict_chat_member(
+                update.effective_chat.id,
+                user.id,
+                ChatPermissions(can_send_messages=False),
+                until_date=until,
+            )
+            await update.message.reply_text(
+                f"⛔ {user.mention_html()} به دلیل تکرار بی‌احترامی سکوت شد.",
+                parse_mode="HTML",
+            )
+            reset_warnings(user.id)
         return
 
-    # build memory
-    history = get_recent_memory(chat.id, user.id, limit=MEMORY_LENGTH)
-    messages = [{"role": "system", "content": "تو یک دستیار فارسی‌زبان، صمیمی، محترم و گروهی هستی. کوتاه، روشن و دوستانه جواب بده."}]
-    for role, content in history:
-        messages.append({"role": role, "content": content})
-    messages.append({"role": "user", "content": user_text})
+    # درخواست فال حافظ
+    if "فال حافظ" in text:
+        await hafez_handler(update, context)
+        return
 
-    try:
-        resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=messages,
-            temperature=0.7,
-            max_tokens=400
+    # درخواست لینک
+    if "لینک عضویت" in text:
+        await invite(update, context)
+        return
+
+    # شروع مکالمه عامیانه با ربات
+    if text.startswith("ربات"):
+        await ai_handler(update, context)
+        return
+
+
+async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.reply_to_message:
+        return
+    target = update.message.reply_to_message.from_user
+
+    text = update.message.text
+    if "محتوای غیر اخلاقی" in text or "محتوای جنسی" in text:
+        until = datetime.now() + timedelta(hours=MUTE_DURATION_HOURS)
+        await context.bot.restrict_chat_member(
+            update.effective_chat.id,
+            target.id,
+            ChatPermissions(can_send_messages=False),
+            until_date=until,
         )
-        reply = resp.choices[0].message.content.strip()
-    except Exception as e:
-        reply = f"خطا در ارتباط با AI: {e}"
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"📢 کاربر {target.mention_html()} به دلیل گزارش محتوا سکوت شد.\nگروه: {update.effective_chat.title}",
+            parse_mode="HTML",
+        )
 
-    await update.message.reply_text(reply)
-    # save to memory
-    add_memory(chat.id, user.id, "user", user_text)
-    add_memory(chat.id, user.id, "assistant", reply)
 
-async def hafez(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def hafez_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    poems = [
+        "درخت دوستی بنشان که کام دل به بار آرد 🌹",
+        "هر که را خوابگه آخر مشتی خاک است 🪶",
+        "به هر که دل بسپاری، به همان رنگ شوی ✨",
+        "از صدای سخن عشق ندیدم خوشتر 🎶",
+    ]
+    poem = random.choice(poems)
     user = update.effective_user
-    poem = get_fal()
     await update.message.reply_text(f"بله {user.first_name} عزیزم:\n\n{poem}")
 
-async def natural_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle colloquial triggers like 'ربات فال حافظ' or 'ربات ...' or complaints"""
-    msg = update.effective_message
-    text = (msg.text or "").strip()
-    if not text:
-        return
 
-    # complaint trigger (needs to be a reply)
-    normalized = normalize_fa(text)
-    complaint_phrases = ["اون محتواي غير اخلاقي فرستاد", "اون محتوای غیر اخلاقی فرستاد", "محتواي جنسي فرستاد", "محتوای جنسی فرستاد"]
-    if any(p in normalized for p in [normalize_fa(p) for p in complaint_phrases]) and msg.reply_to_message:
-        target: User = msg.reply_to_message.from_user
-        until = datetime.utcnow() + timedelta(hours=MUTE_DURATION_HOURS)
-        try:
-            await context.bot.restrict_chat_member(
-                chat_id=msg.chat_id,
-                user_id=target.id,
-                permissions=ChatPermissions(can_send_messages=False),
-                until_date=until
-            )
-            await msg.reply_text(f"🔇 @{target.username or target.first_name} به صورت موقت سکوت شد تا ادمین بررسی کند.")
-            add_audit(msg.chat_id, target.id, msg.from_user.id, "mute_on_report", "reported_by_user")
-            await ensure_admin_notice(context, f"📣 گزارش محتوای نامناسب: هدف @{target.username or target.id} / گزارش‌دهنده @{msg.from_user.username or msg.from_user.id}")
-        except Exception as e:
-            await msg.reply_text("نتوانستم سکوت کنم؛ احتمالاً ادمین نیستم.")
-        return
+async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    text = update.message.text
 
-    # Hafez trigger
-    if re.search(r"(ربات|بات).*(فال|حافظ)", normalized):
-        await hafez(update, context)
-        return
-
-    # AI trigger: messages that start with 'ربات' or bot mention
-    entity_mentions = [e.user.username for e in (msg.entities or []) if getattr(e, "user", None)]
-    if normalized.startswith("ربات") or (context.bot.username and f"@{context.bot.username.lower()}" in normalized) or (context.bot.username in entity_mentions if entity_mentions else False):
-        # remove the 'ربات' keyword
-        cleaned = re.sub(r"^(ربات|بات)\s*", "", text, flags=re.IGNORECASE)
-        update_cpy = Update.de_json(update.to_dict(), context.bot)
-        update_cpy.message.text = "/ai " + cleaned
-        await ai_chat(update_cpy, context)
-        return
-
-async def warns(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # show user's warnings (simple read from DB)
-    from memory import sqlite3, DB_PATH
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute("SELECT warnings, mutes FROM warnings WHERE chat_id=? AND user_id=?", (update.effective_chat.id, update.effective_user.id))
-        row = c.fetchone()
-    warns = row[0] if row else 0
-    mutes = row[1] if row else 0
-    await update.message.reply_text(f"اخطارها: {warns}/{INFRACTION_LIMIT} | سکوت‌ها: {mutes}")
-
-async def add_badword(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("فقط ادمین می‌تواند اضافه کند.")
-        return
-    if not context.args:
-        await update.message.reply_text("استفاده: /addbadword کلمه")
-        return
-    word = " ".join(context.args).strip()
-    PROFANITIES.add(word)
-    with open("profanity.json", "w", encoding="utf-8") as f:
-        json.dump(sorted(list(PROFANITIES)), f, ensure_ascii=False, indent=2)
-    await update.message.reply_text(f"✅ اضافه شد: {word}")
-
-async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # First, moderation
-    handled = await handle_profanity(update, context)
-    if handled:
-        return
-    # Otherwise, let natural triggers handle
-    await natural_triggers(update, context)
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
-        await ensure_admin_notice(context, f"⚠️ خطا: {context.error}")
-    except Exception:
-        pass
+        resp = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "تو یک ربات صمیمی تلگرام هستی که عامیانه و دوستانه جواب میده."},
+                {"role": "user", "content": text},
+            ],
+        )
+        answer = resp.choices[0].message.content
+        await update.message.reply_text(answer)
+    except Exception as e:
+        await update.message.reply_text("❌ خطا در ارتباط با هوش مصنوعی.")
 
+
+async def invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if MEETUP_BOT_USERNAME:
+        await update.message.reply_text(f"🔗 لینک عضویت: {MEETUP_BOT_USERNAME}")
+    else:
+        await update.message.reply_text("❌ لینک عضویت در تنظیمات ربات تعریف نشده.")
+
+
+# ========= main ========= #
 async def main():
-    os.makedirs("data", exist_ok=True)
-    init_db()
-    application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
+    # هندلرها
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_cmd))
-    application.add_handler(CommandHandler("ai", ai_chat))
-    application.add_handler(CommandHandler("hafez", hafez))
+    application.add_handler(CommandHandler("hafez", hafez_handler))
+    application.add_handler(CommandHandler("ai", ai_handler))
     application.add_handler(CommandHandler("invite", invite))
-    application.add_handler(CommandHandler("warns", warns))
-    application.add_handler(CommandHandler("addbadword", add_badword))
 
-    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, new_member))
-    application.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS, group_text))
+    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(MessageHandler(filters.TEXT & filters.REPLY, report_handler))
 
-    application.add_error_handler(error_handler)
+    me = await application.bot.get_me()
+    print(f"✅ Bot started as @{me.username}")
 
-    # Run long-polling (ساده‌ترین روش روی Railway)
-await application.initialize()
-me = await application.bot.get_me()
-print(f"Bot started as @{me.username}")
-await application.start()
-await application.run_polling()
+    await application.run_polling()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("❌ Bot stopped.")
