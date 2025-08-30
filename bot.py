@@ -298,15 +298,8 @@ async def main():
     application.add_error_handler(error_handler)
 
     # Run long-polling (ساده‌ترین روش روی Railway)
-    await application.initialize()
-    me = await application.bot.get_me()
-    print(f"Bot started as @{me.username}")
-    await application.start()
-    await application.updater.start_polling()
-    await application.updater.idle()
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        pass
+await application.initialize()
+me = await application.bot.get_me()
+print(f"Bot started as @{me.username}")
+await application.start()
+await application.run_polling()
