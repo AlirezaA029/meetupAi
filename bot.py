@@ -1,5 +1,4 @@
 import os
-import asyncio
 import json
 import random
 import sqlite3
@@ -10,8 +9,8 @@ from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    filters,
     ContextTypes,
+    filters,
 )
 
 from openai import AsyncOpenAI
@@ -29,7 +28,7 @@ MEETUP_BOT_USERNAME = os.getenv("MEETUP_BOT_USERNAME", "")
 # کلاینت OpenAI
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-# ========= دیتابیس برای اخطار و حافظه ========= #
+# ========= دیتابیس برای اخطار ========= #
 DB_FILE = "bot.db"
 
 def init_db():
@@ -191,7 +190,7 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         answer = resp.choices[0].message.content
         await update.message.reply_text(answer)
-    except Exception as e:
+    except Exception:
         await update.message.reply_text("❌ خطا در ارتباط با هوش مصنوعی.")
 
 
@@ -203,7 +202,7 @@ async def invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ========= main ========= #
-async def main():
+def main():
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     # هندلرها
@@ -216,14 +215,9 @@ async def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(MessageHandler(filters.TEXT & filters.REPLY, report_handler))
 
-    me = await application.bot.get_me()
-    print(f"✅ Bot started as @{me.username}")
-
-    await application.run_polling()
+    print("✅ Bot started!")
+    application.run_polling()
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        print("❌ Bot stopped.")
+    main()
